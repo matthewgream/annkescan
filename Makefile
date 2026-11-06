@@ -1,7 +1,7 @@
 
 ##
 
-TARGET=annkedetect
+TARGET=annkescan
 HOSTNAME:=$(shell hostname)
 CFG_SRC:=$(if $(wildcard $(TARGET).$(HOSTNAME).cfg),$(TARGET).$(HOSTNAME).cfg,$(TARGET).cfg)
 
@@ -48,9 +48,9 @@ test: $(TARGET) $(MODELS) node_modules
 
 ##
 
-INSTALL=annkedetect
+INSTALL=annkescan
 DIR_INSTALL=/usr/local/bin
-DIR_LIB=/usr/local/lib/annkedetect
+DIR_LIB=/usr/local/lib/annkescan
 DIR_DEFAULT=/etc/default
 DIR_SYSTEMD=/etc/systemd/system
 define install_depend_systemd

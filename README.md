@@ -1,4 +1,15 @@
-# annkedetect
+# annkescan
+
+One of three tools for an archive of Annke camera clips, each working on what the one before left:
+
+| | |
+|---|---|
+| [annkepull](https://github.com/matthewgream/annkepull) | fetches the event clips from the cameras' SD cards into the archive, every 6 hours |
+| **annkescan** | flags the people, animals and vehicles in each clip, with a daily report to MQTT |
+| [annkeserv](https://github.com/matthewgream/annkeserv) | browses the archive over HTTP, with what annkescan found |
+
+They share nothing but the archive's files (`<archive>/<camera>/<YYYYMMDD>/recording_<...>.mp4`, with
+annkescan's `.json` and `.jpg` beside each clip), so each runs on its own.
 
 Flags the people, animals and vehicles seen in the camera archive's clips (those `annkepull` fetches), for
 `annkeserv` to show. A long-running worker at idle priority: it works through the clips that have no
@@ -26,7 +37,7 @@ MQTT (`mqtt-server`, empty for none), not retained, on `<mqtt-topic>/<YYYYMMDD>`
 annkepull brings clips every 6 hours, so the report waits for a time of day rather than going each time they
 are done: the morning's pull (04:00-04:30, done in some minutes) and its clips are done by then, and the
 wait between looks for clips ends at that time, so there is one last look first. If clips are still being
-done then, it goes when they are. What it has so far is kept in `/var/lib/annkedetect/report.json`, so a
+done then, it goes when they are. What it has so far is kept in `/var/lib/annkescan/report.json`, so a
 restart in the day loses nothing. With `report-at` empty, it goes each time the clips are done.
 
 ```json
@@ -45,10 +56,10 @@ report, and nothing left held for the next day's to be lost behind.
 
 | | |
 |---|---|
-| `annkedetect` | the tool (Node; npm dependency `onnxruntime-node`; uses `ffmpeg`, `ffprobe`, and `mosquitto_pub` for the report) |
+| `annkescan` | the tool (Node; npm dependency `onnxruntime-node`; uses `ffmpeg`, `ffprobe`, and `mosquitto_pub` for the report) |
 | `widewatch` | a trial for the wide camera, run by hand (see [Wide](#wide-trial)); also needs `mqtt` |
-| `annkedetect.service` | the worker, `Nice=19`, `CPUSchedulingPolicy=idle`, `IOSchedulingClass=idle` |
-| `annkedetect-storage.service` | gate: it needs `opt-storage-disk.mount` |
+| `annkescan.service` | the worker, `Nice=19`, `CPUSchedulingPolicy=idle`, `IOSchedulingClass=idle` |
+| `annkescan-storage.service` | gate: it needs `opt-storage-disk.mount` |
 
 ## What counts
 
@@ -128,7 +139,7 @@ edge, again and again.
 
 In its folder (`--out`, default `/opt/storage/disk/widewatch`): `latest.jpg`, the last still's zone with the
 boxes; the stills where something was found, kept like that by day; and `widewatch.jsonl`, every line. It
-takes masks, models and the threshold from annkedetect's config.
+takes masks, models and the threshold from annkescan's config.
 
 ## False positives
 
@@ -138,7 +149,7 @@ here and there, always in much the same box. To screen one out, copy a result th
 `screens` folder:
 
 ```sh
-cp /opt/storage/camera/side/20261006/recording_20261006131456.json /opt/annkedetect/annkedetect.workshop/screens/
+cp /opt/storage/camera/side/20261006/recording_20261006131456.json /opt/annkescan/annkescan.workshop/screens/
 ```
 
 Every detection in a file there becomes a known false positive for that result's camera (if the clip also
@@ -153,7 +164,7 @@ When the folder changes, every result already written is checked against it agai
 result recorded, without detecting again -- so dropping a file in clears the past too, and taking it out
 brings those detections back; thumbnails are redrawn or removed to match. The folder is watched
 (inotify), so that happens within seconds of the change, even when there are no clips to do. Which screens
-the archive was last checked against is kept in `/var/lib/annkedetect`, so a restart does not check it all
+the archive was last checked against is kept in `/var/lib/annkescan`, so a restart does not check it all
 again.
 
 ## Cost
@@ -165,13 +176,13 @@ for both cameras, and a few days for the whole archive. `days=<n>` limits it to 
 ## Install
 
 ```sh
-make install      # models (fetched, checksummed), tool + npm dependencies to /usr/local/lib/annkedetect, config, units
+make install      # models (fetched, checksummed), tool + npm dependencies to /usr/local/lib/annkescan, config, units
 make status       # the worker and its last log lines
 make test CLIP="/opt/storage/camera/side/<YYYYMMDD>/recording_<...>.mp4"   # what a clip would get, writing nothing
 ```
 
-Config goes to `/etc/default/annkedetect`; a per-host `annkedetect.<hostname>.cfg` is used instead of
-`annkedetect.cfg` when present. A host's masks can sit beside it in `annkedetect.<hostname>/` (with the
+Config goes to `/etc/default/annkescan`; a per-host `annkescan.<hostname>.cfg` is used instead of
+`annkescan.cfg` when present. A host's masks can sit beside it in `annkescan.<hostname>/` (with the
 snapshots they were painted on); like the per-host config, that folder is not committed.
 
 ## Notes

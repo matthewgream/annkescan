@@ -1,7 +1,7 @@
 # per-host configs and masks stay local, as for the other tools (the masks' folder also holds the
 # cameras' base snapshots, which are photos of the place)
-annkedetect.*.cfg
-annkedetect.*/
+annkescan.*.cfg
+annkescan.*/
 node_modules/
 # fetched by make (see MODEL_URL): too big for the repo
 models/

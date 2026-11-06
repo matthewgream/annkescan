@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// annkedetect -- flag the people, animals and vehicles seen in the camera archive's clips, for annkeserv.
+// annkescan -- flag the people, animals and vehicles seen in the camera archive's clips, for annkeserv.
 //
 // A long-running worker at idle priority. It looks for the clips annkepull archived
 // (<archive>/<camera>/<YYYYMMDD>/recording_<...>.mp4) that have no result beside them yet, and works through
@@ -38,9 +38,9 @@
 // to MQTT (mqtt-server, <mqtt-topic>/<YYYYMMDD>): per camera and in all, the clips, their length, and how many had
 // each group seen, with people_or_animals for mqtt-watchdog to notify on.
 //
-// Config: /etc/default/annkedetect (key=value).
-// Usage: annkedetect [config]                                      work through the archive, then keep watching it
-//        annkedetect [config] [--model <name>] --test <clip> ...  print what each clip would get, writing nothing
+// Config: /etc/default/annkescan (key=value).
+// Usage: annkescan [config]                                      work through the archive, then keep watching it
+//        annkescan [config] [--model <name>] --test <clip> ...  print what each clip would get, writing nothing
 //                                                                  (with the detector its time gets, or <name>'s)
 
 'use strict';
@@ -56,7 +56,7 @@ const testAt = args.indexOf('--test');
 const opts = testAt < 0 ? args : args.slice(0, testAt);
 const modelAt = opts.indexOf('--model');
 const TEST_MODEL = modelAt < 0 ? undefined : opts[modelAt + 1];
-const CFG_FILE = opts.find((a, i) => !a.startsWith('--') && (modelAt < 0 || i !== modelAt + 1)) || '/etc/default/annkedetect';
+const CFG_FILE = opts.find((a, i) => !a.startsWith('--') && (modelAt < 0 || i !== modelAt + 1)) || '/etc/default/annkescan';
 const TEST_CLIPS = testAt < 0 ? undefined : args.slice(testAt + 1);
 const cfg = {};
 try {
@@ -65,7 +65,7 @@ try {
         if (m) cfg[m[1]] = m[2];
     }
 } catch (e) {
-    console.error(`annkedetect: ${CFG_FILE}: ${e.message}`);
+    console.error(`annkescan: ${CFG_FILE}: ${e.message}`);
     process.exit(1);
 }
 const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cfg[k])) ? Number(cfg[k]) : d);
@@ -97,19 +97,19 @@ const REPORT_STATE = process.env.STATE_DIRECTORY ? path.join(process.env.STATE_D
 for (const cam of CAMERAS)
     for (const g of cam.groups)
         if (!GROUPS.includes(g)) {
-            console.error(`annkedetect: ${CFG_FILE}: camera-${cam.name}: unknown group "${g}" (${GROUPS.join(', ')})`);
+            console.error(`annkescan: ${CFG_FILE}: camera-${cam.name}: unknown group "${g}" (${GROUPS.join(', ')})`);
             process.exit(1);
         }
 if (REPORT_AT && !/^([01]?\d|2[0-3]):[0-5]\d$/.test(REPORT_AT)) {
-    console.error(`annkedetect: ${CFG_FILE}: report-at: "${REPORT_AT}" is not HH:MM`);
+    console.error(`annkescan: ${CFG_FILE}: report-at: "${REPORT_AT}" is not HH:MM`);
     process.exit(1);
 }
 if (!CAMERAS.length && !TEST_CLIPS) {
-    console.error(`annkedetect: ${CFG_FILE}: no camera-<name>=<groups> entries`);
+    console.error(`annkescan: ${CFG_FILE}: no camera-<name>=<groups> entries`);
     process.exit(1);
 }
 if (YOLO26_FROM && !/^\d{14}$/.test(YOLO26_FROM)) {
-    console.error(`annkedetect: ${CFG_FILE}: yolo26-from: "${YOLO26_FROM}" is not YYYYMMDDHHMMSS`);
+    console.error(`annkescan: ${CFG_FILE}: yolo26-from: "${YOLO26_FROM}" is not YYYYMMDDHHMMSS`);
     process.exit(1);
 }
 
@@ -123,7 +123,7 @@ const DETECTORS = {
     yolo26: { file: 'yolo26s.onnx', name: 'yolo26s (coco, onnx-community)', input: 'pixel_values', rgb: true, decode: decodeYolo26 },
 };
 if (TEST_MODEL && !DETECTORS[TEST_MODEL]) {
-    console.error(`annkedetect: --model: unknown "${TEST_MODEL}" (${Object.keys(DETECTORS).join(', ')})`);
+    console.error(`annkescan: --model: unknown "${TEST_MODEL}" (${Object.keys(DETECTORS).join(', ')})`);
     process.exit(1);
 }
 const detectorFor = (stamp) => (YOLO26_FROM && stamp >= YOLO26_FROM ? 'yolo26' : 'yolox');
@@ -877,7 +877,7 @@ async function scan() {
         return;
     }
     log(
-        `annkedetect: ${CAMERAS.map((c) => `${c.name}=${c.groups.join('+')}${c.tiles > 1 ? `/tiles ${c.tiles}` : ''}`).join(' ')} in ${ARCHIVE}` +
+        `annkescan: ${CAMERAS.map((c) => `${c.name}=${c.groups.join('+')}${c.tiles > 1 ? `/tiles ${c.tiles}` : ''}`).join(' ')} in ${ARCHIVE}` +
             `${DAYS ? `, last ${DAYS} days` : ''}, threshold ${THRESHOLD}, masks ${MASKS || 'none'}, screens ${SCREENS || 'none'}` +
             `, detector yolox${YOLO26_FROM ? `, yolo26 for clips from ${YOLO26_FROM}` : ''}` +
             `, reports ${MQTT_SERVER ? `to ${MQTT_SERVER} ${MQTT_TOPIC}/<day>${REPORT_AT ? ` at ${REPORT_AT}` : ''}` : 'none'}`
@@ -890,14 +890,14 @@ async function scan() {
         try {
             todo = await scan();
         } catch (e) {
-            log(`annkedetect: scan: ${e.message}`);
+            log(`annkescan: scan: ${e.message}`);
         }
         if (!todo.length) {
             if (MQTT_SERVER && reportDue()) await sendReport();
             await idle(Math.min(RESCAN * 1000, untilReport() + 1000));
             continue;
         }
-        log(`annkedetect: ${todo.length} clips to do, ${todo[0].stamp.slice(0, 8)} back to ${todo.at(-1).stamp.slice(0, 8)}`);
+        log(`annkescan: ${todo.length} clips to do, ${todo[0].stamp.slice(0, 8)} back to ${todo.at(-1).stamp.slice(0, 8)}`);
         // look again for new clips every RESCAN seconds, so they go ahead of the backlog
         const until = Date.now() + RESCAN * 1000,
             t0 = Date.now();
@@ -909,9 +909,9 @@ async function scan() {
             done++;
             if (Date.now() > until) break;
         }
-        log(`annkedetect: ${done} done (${flagged} with something seen) in ${Math.round((Date.now() - t0) / 60000)}m`);
+        log(`annkescan: ${done} done (${flagged} with something seen) in ${Math.round((Date.now() - t0) / 60000)}m`);
     }
 })().catch((e) => {
-    console.error(`annkedetect: ${e.message}`);
+    console.error(`annkescan: ${e.message}`);
     process.exit(1);
 });

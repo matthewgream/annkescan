@@ -1,5 +1,5 @@
 {
-    "name": "annkedetect",
+    "name": "annkescan",
     "version": "1.0.0",
     "description": "flag people, animals and vehicles in archived camera clips",
     "private": true,

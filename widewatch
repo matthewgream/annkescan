@@ -26,7 +26,7 @@
 // archiver's snapshots/<YYYYMMDD>/snapshot_<time>.jpg, for 12 days; their time is UTC, the clock's local.
 //
 // Usage: widewatch [config] [--broker <url>] [--topic <prefix>] [--out <dir>]
-//        config: annkedetect's (for masks, models, threshold), default /etc/default/annkedetect;
+//        config: annkescan's (for masks, models, threshold), default /etc/default/annkescan;
 //        --broker mqtt://localhost, --topic snapshots, --out /opt/storage/disk/widewatch
 
 'use strict';
@@ -44,7 +44,7 @@ const opt = (name, d) => {
     const i = args.indexOf(`--${name}`);
     return i < 0 || args[i + 1] === undefined ? d : args[i + 1];
 };
-const CFG_FILE = args.find((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--'))) || '/etc/default/annkedetect';
+const CFG_FILE = args.find((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--'))) || '/etc/default/annkescan';
 const cfg = {};
 try {
     for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
@@ -55,7 +55,7 @@ try {
     console.error(`widewatch: ${CFG_FILE}: ${e.message}`);
     process.exit(1);
 }
-const MASK = path.join(cfg['masks'] || path.join(__dirname, `annkedetect.${os.hostname()}`), 'wide-mask-cars.png');
+const MASK = path.join(cfg['masks'] || path.join(__dirname, `annkescan.${os.hostname()}`), 'wide-mask-cars.png');
 const MODELS = cfg['models'] || path.join(__dirname, 'models');
 const THRESHOLD = cfg['threshold'] && !isNaN(Number(cfg['threshold'])) ? Number(cfg['threshold']) : 0.4;
 const THREADS = cfg['threads'] && !isNaN(Number(cfg['threads'])) ? Number(cfg['threads']) : 2;
@@ -126,7 +126,7 @@ function jpegSize(buf) {
 
 // ------------------------------------------------------------------------------------------ detectors
 
-// YOLO26s (COCO), as in annkedetect
+// YOLO26s (COCO), as in annkescan
 
 const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
 function iou(a, b) {

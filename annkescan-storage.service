@@ -1,5 +1,5 @@
 [Unit]
-Description=annkedetect - archive storage
+Description=annkescan - archive storage
 Requires=opt-storage-disk.mount
 After=opt-storage-disk.mount
 
