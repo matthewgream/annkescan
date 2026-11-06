@@ -5,8 +5,9 @@
 // A long-running worker at idle priority. It looks for the clips annkepull archived
 // (<archive>/<camera>/<YYYYMMDD>/recording_<...>.mp4) that have no result beside them yet, and works through
 // them newest first: a new clip is flagged soon after it arrives, and older ones are done when there is
-// nothing new. For each clip it decodes the keyframes (one every 2-3 s), runs an object detector over each
-// (YOLOX-S, trained on COCO, through ONNX Runtime), and writes beside the clip
+// nothing new. For each clip it decodes the keyframes (one every 8 s on side, 3.8 s on front), runs an object
+// detector over each (trained on COCO, through ONNX Runtime: YOLOX-S, or YOLO26s for clips recorded from
+// yolo26-from on), and writes beside the clip
 //
 //     recording_<...>.json   {"seen": {"people": 0.85, "animals": 0.47}, "detections": [...], "ignored": [...]}
 //     recording_<...>.jpg    only when something was seen: the keyframe with the best detection, boxes drawn
@@ -31,11 +32,16 @@
 //     box's centre inside the false positive's box, at no more than twice or half its size) is ignored --
 //     side's tank lid, a "car" in one keyframe of a clip but never in all of them, which the rule above
 //     needs. Results already written are checked again whenever the folder changes, so a file dropped in
-//     (or taken out) also corrects the past.
+//     (or taken out) also corrects the past. The folder is watched, so that is within seconds.
+//
+// Once a day (report-at, by when the morning's pull is done), a report of the clips done since the last one goes
+// to MQTT (mqtt-server, <mqtt-topic>/<YYYYMMDD>): per camera and in all, the clips, their length, and how many had
+// each group seen, with people_or_animals for mqtt-watchdog to notify on.
 //
 // Config: /etc/default/annkedetect (key=value).
-// Usage: annkedetect [config]                    work through the archive, then keep watching it
-//        annkedetect [config] --test <clip> ...  print what each clip would get, writing nothing
+// Usage: annkedetect [config]                                      work through the archive, then keep watching it
+//        annkedetect [config] [--model <name>] --test <clip> ...  print what each clip would get, writing nothing
+//                                                                  (with the detector its time gets, or <name>'s)
 
 'use strict';
 const fs = require('fs');
@@ -47,7 +53,10 @@ const ort = require('onnxruntime-node');
 
 const args = process.argv.slice(2);
 const testAt = args.indexOf('--test');
-const CFG_FILE = (testAt < 0 ? args : args.slice(0, testAt)).find((a) => !a.startsWith('--')) || '/etc/default/annkedetect';
+const opts = testAt < 0 ? args : args.slice(0, testAt);
+const modelAt = opts.indexOf('--model');
+const TEST_MODEL = modelAt < 0 ? undefined : opts[modelAt + 1];
+const CFG_FILE = opts.find((a, i) => !a.startsWith('--') && (modelAt < 0 || i !== modelAt + 1)) || '/etc/default/annkedetect';
 const TEST_CLIPS = testAt < 0 ? undefined : args.slice(testAt + 1);
 const cfg = {};
 try {
@@ -70,14 +79,20 @@ const CAMERAS = Object.entries(cfg) // camera-<name>=<groups to flag>, tiles-<na
     });
 const ARCHIVE = cfg['archive'] || '/opt/storage/camera';
 const MASKS = cfg['masks'] || ''; // directory of <camera>-mask*.png; empty: no masks
-const MODEL = cfg['model'] || path.join(__dirname, 'models', 'yolox_s.onnx');
+const MODELS = cfg['models'] || path.join(__dirname, 'models'); // directory of the detectors' .onnx files
+const YOLO26_FROM = cfg['yolo26-from'] || ''; // clips recorded from then on (YYYYMMDDHHMMSS, as in their names) get YOLO26
 const THRESHOLD = num('threshold', 0.4); // score a detection needs to count
 const DAYS = num('days', 0); // only clips from the last <n> days; 0: the whole archive
-const RESCAN = num('rescan', 3600); // seconds between looks for new clips (annkepull brings them once a day)
+const RESCAN = num('rescan', 3600); // seconds between looks for new clips (annkepull brings them every 6 hours)
 const THREADS = num('threads', 2);
 const SCREENS = cfg['screens'] || ''; // directory of result files whose detections are false positives; empty: none
 // where the screens last applied to the archive are remembered, so a restart does not check it all again
 const SCREENS_APPLIED = process.env.STATE_DIRECTORY ? path.join(process.env.STATE_DIRECTORY, 'screens.applied') : '';
+const MQTT_SERVER = cfg['mqtt-server'] || ''; // where the report goes; empty: none
+const MQTT_TOPIC = cfg['mqtt-topic'] || 'camera/detect'; // the report's topic is <topic>/<YYYYMMDD>
+const REPORT_AT = cfg['report-at'] ?? '06:00'; // the time of day (HH:MM, local) it goes; empty: whenever the clips are done
+// the report under way and the day the last one went, so a restart loses neither
+const REPORT_STATE = process.env.STATE_DIRECTORY ? path.join(process.env.STATE_DIRECTORY, 'report.json') : '';
 
 for (const cam of CAMERAS)
     for (const g of cam.groups)
@@ -85,13 +100,35 @@ for (const cam of CAMERAS)
             console.error(`annkedetect: ${CFG_FILE}: camera-${cam.name}: unknown group "${g}" (${GROUPS.join(', ')})`);
             process.exit(1);
         }
+if (REPORT_AT && !/^([01]?\d|2[0-3]):[0-5]\d$/.test(REPORT_AT)) {
+    console.error(`annkedetect: ${CFG_FILE}: report-at: "${REPORT_AT}" is not HH:MM`);
+    process.exit(1);
+}
 if (!CAMERAS.length && !TEST_CLIPS) {
     console.error(`annkedetect: ${CFG_FILE}: no camera-<name>=<groups> entries`);
     process.exit(1);
 }
+if (YOLO26_FROM && !/^\d{14}$/.test(YOLO26_FROM)) {
+    console.error(`annkedetect: ${CFG_FILE}: yolo26-from: "${YOLO26_FROM}" is not YYYYMMDDHHMMSS`);
+    process.exit(1);
+}
+
+// The detectors: the model file, its input, and how its output is decoded. YOLOX-S came first. YOLO26s took
+// over for clips recorded from yolo26-from on (2026-10-28): in a bake-off on 57 clips it had none of YOLOX's
+// false positives (a log as a "dog", a downpipe as a "person", heads at the frame's edge as "birds", side's
+// lid and block pallets as vehicles) but missed side's tractor at night. Clips from before -- the backlog --
+// stay with YOLOX, so the switch happens once, at a time, not part way through the archive.
+const DETECTORS = {
+    yolox: { file: 'yolox_s.onnx', name: 'yolox-s (coco, 2022nov)', input: 'images', rgb: false, decode: decodeYolox },
+    yolo26: { file: 'yolo26s.onnx', name: 'yolo26s (coco, onnx-community)', input: 'pixel_values', rgb: true, decode: decodeYolo26 },
+};
+if (TEST_MODEL && !DETECTORS[TEST_MODEL]) {
+    console.error(`annkedetect: --model: unknown "${TEST_MODEL}" (${Object.keys(DETECTORS).join(', ')})`);
+    process.exit(1);
+}
+const detectorFor = (stamp) => (YOLO26_FROM && stamp >= YOLO26_FROM ? 'yolo26' : 'yolox');
 
 const VERSION = 1;
-const MODEL_NAME = 'yolox-s (coco, 2022nov)';
 const SIZE = 640; // the model's input, square
 const OVERLAP = 64; // between tiles, so a thing on a seam is whole in one of them
 const STEP = SIZE - OVERLAP;
@@ -117,24 +154,25 @@ const RE_CLIP = /^recording_(\d{14})(?:_\d+)?\.mp4$/;
 // ------------------------------------------------------------------------------------------ util
 
 const log = (...a) => console.log(...a); // journald stamps it
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const even = (n) => Math.max(2, Math.round(n / 2) * 2);
 const pad = (n) => String(n).padStart(2, '0');
 const dayOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
 const round = (n, places) => Math.round(n * 10 ** places) / 10 ** places;
 
-function run(cmd, argv, binary = false) {
+function run(cmd, argv, binary = false, input = undefined) {
     return new Promise((resolve, reject) => {
         const child = spawn(cmd, argv, { timeout: 600000 });
         const out = [],
             err = [];
         child.stdout.on('data', (d) => out.push(d));
         child.stderr.on('data', (d) => err.push(d));
+        child.stdin.on('error', () => {}); // one that gave up before reading it
         child.on('error', reject);
         child.on('close', (code, signal) => {
             if (code === 0) return resolve(binary ? Buffer.concat(out) : Buffer.concat(out).toString());
             reject(new Error(Buffer.concat(err).toString().trim().split('\n').pop() || `${cmd} exited ${code ?? signal}`));
         });
+        child.stdin.end(input);
     });
 }
 
@@ -212,7 +250,14 @@ function inZone(masks, group, box, w, h) {
 
 // ------------------------------------------------------------------------------------------ detector
 
-let session;
+// each detector's session, made when a clip first needs it
+const sessions = {};
+const sessionFor = (name) =>
+    (sessions[name] ??= ort.InferenceSession.create(path.join(MODELS, DETECTORS[name].file), {
+        intraOpNumThreads: THREADS,
+        interOpNumThreads: 1,
+        logSeverityLevel: 3,
+    }));
 
 // YOLOX's output is per anchor of a 80x80, 40x40 and 20x20 grid: cx, cy, w, h (in grid cells), objectness, 80 class scores
 const ANCHORS = [];
@@ -230,8 +275,9 @@ function nms(dets) {
     return keep;
 }
 
-function decode(out, classes) {
-    const found = [];
+function decodeYolox(outputs, classes) {
+    const out = outputs.output.data,
+        found = [];
     for (const [id, name, group] of classes) {
         const candidates = [];
         for (let i = 0; i < ANCHORS.length; i++) {
@@ -250,17 +296,38 @@ function decode(out, classes) {
     return found;
 }
 
-// one model input from a tile of a BGR frame: planar, 0..255, padded with YOLOX's 114
-function tensor(frame, W, H, tx, ty) {
-    const data = new Float32Array(3 * SIZE * SIZE).fill(114),
-        plane = SIZE * SIZE;
+// YOLO26's output is end to end (no anchors, no suppression needed): per query, 80 class logits, and a box
+// (centre and size as fractions of the input)
+function decodeYolo26(outputs, classes) {
+    const logits = outputs.logits.data,
+        boxes = outputs.pred_boxes.data,
+        found = [];
+    for (let q = 0; q < outputs.logits.dims[1]; q++)
+        for (const [id, name, group] of classes) {
+            const score = 1 / (1 + Math.exp(-logits[q * 80 + id]));
+            if (score <= THRESHOLD) continue;
+            const x = boxes[q * 4] * SIZE,
+                y = boxes[q * 4 + 1] * SIZE,
+                w = boxes[q * 4 + 2] * SIZE,
+                h = boxes[q * 4 + 3] * SIZE;
+            found.push({ name, group, score, box: [x - w / 2, y - h / 2, x + w / 2, y + h / 2] });
+        }
+    return found;
+}
+
+// one model input from a tile of a BGR frame, planar, padded with 114 grey: BGR 0..255 for YOLOX, RGB 0..1 for YOLO26
+function tensor(frame, W, H, tx, ty, rgb) {
+    const f = rgb ? 1 / 255 : 1,
+        data = new Float32Array(3 * SIZE * SIZE).fill(114 * f),
+        plane = SIZE * SIZE,
+        [c0, c2] = rgb ? [2, 0] : [0, 2];
     const tw = Math.min(SIZE, W - tx),
         th = Math.min(SIZE, H - ty);
     for (let y = 0; y < th; y++)
         for (let x = 0, src = ((ty + y) * W + tx) * 3, dst = y * SIZE; x < tw; x++, src += 3, dst++) {
-            data[dst] = frame[src];
-            data[plane + dst] = frame[src + 1];
-            data[2 * plane + dst] = frame[src + 2];
+            data[dst] = frame[src + c0] * f;
+            data[plane + dst] = frame[src + 1] * f;
+            data[2 * plane + dst] = frame[src + c2] * f;
         }
     return new ort.Tensor('float32', data, [1, 3, SIZE, SIZE]);
 }
@@ -273,7 +340,7 @@ function tileStarts(len) {
 
 // ------------------------------------------------------------------------------------------ clips
 
-// size, and keyframe times in seconds from the start, from the packets (without decoding)
+// size, length, and keyframe times in seconds from the start, from the packets (without decoding)
 async function probe(clip) {
     const j = JSON.parse(
         await run('ffprobe', [
@@ -282,7 +349,7 @@ async function probe(clip) {
             '-select_streams',
             'v:0',
             '-show_entries',
-            'stream=width,height:format=start_time:packet=pts_time,flags',
+            'stream=width,height:format=start_time,duration:packet=pts_time,flags',
             '-of',
             'json',
             clip,
@@ -293,7 +360,7 @@ async function probe(clip) {
         .filter((p) => p.flags?.startsWith('K'))
         .map((p) => Number(p.pts_time) - start)
         .sort((a, b) => a - b);
-    return { w: j.streams[0].width, h: j.streams[0].height, keys };
+    return { w: j.streams[0].width, h: j.streams[0].height, duration: Number(j.format?.duration) || 0, keys };
 }
 
 // the keyframes, cropped to the bounds and scaled to <tiles> tiles across, as raw BGR
@@ -339,10 +406,12 @@ async function keyframes(clip, w, h, bounds, tiles) {
     };
 }
 
-async function detectClip(cam, clip) {
+async function detectClip(cam, clip, detector) {
+    const det = DETECTORS[detector],
+        session = await sessionFor(detector);
     const masks = await masksFor(cam);
     const classes = CLASSES.filter(([, , g]) => cam.groups.includes(g));
-    const { w, h, keys } = await probe(clip);
+    const { w, h, duration, keys } = await probe(clip);
     const kf = await keyframes(clip, w, h, masksBounds(masks, cam.groups), cam.tiles);
     const xs = tileStarts(kf.W),
         ys = tileStarts(kf.H);
@@ -351,8 +420,8 @@ async function detectClip(cam, clip) {
         const dets = [];
         for (const ty of ys)
             for (const tx of xs) {
-                const out = Object.values(await session.run({ images: tensor(frame, kf.W, kf.H, tx, ty) }))[0].data;
-                for (const d of decode(out, classes))
+                const outputs = await session.run({ [det.input]: tensor(frame, kf.W, kf.H, tx, ty, det.rgb) });
+                for (const d of det.decode(outputs, classes))
                     dets.push({
                         ...d,
                         box: [
@@ -393,7 +462,21 @@ async function detectClip(cam, clip) {
             }
         }
     });
-    return { w, h, result: { version: VERSION, model: MODEL_NAME, camera: cam.name, tiles: cam.tiles, keyframes: frames.length, seen, detections, ignored } };
+    return {
+        w,
+        h,
+        result: {
+            version: VERSION,
+            model: det.name,
+            camera: cam.name,
+            tiles: cam.tiles,
+            duration: round(duration, 1),
+            keyframes: frames.length,
+            seen,
+            detections,
+            ignored,
+        },
+    };
 }
 
 // the keyframe with the best detection, 640 wide, with that keyframe's detections boxed in their group's colour
@@ -437,25 +520,139 @@ async function thumbnail(clip, w, h, detections, file) {
 
 const failed = new Set(); // clips that failed: left until a restart rather than retried every pass
 
-async function doClip({ cam, clip }) {
+async function doClip({ cam, clip, stamp }) {
     const json = clip.replace(/\.mp4$/, '.json'),
         jpg = clip.replace(/\.mp4$/, '.jpg'),
-        name = path.relative(path.join(ARCHIVE, cam.name), clip);
+        name = path.relative(path.join(ARCHIVE, cam.name), clip),
+        detector = detectorFor(stamp);
     const t0 = Date.now();
     try {
-        const { w, h, result } = await detectClip(cam, clip);
+        const { w, h, result } = await detectClip(cam, clip, detector);
         if (result.detections.length) await thumbnail(clip, w, h, result.detections, jpg);
         else fs.rmSync(jpg, { force: true });
         writeAtomic(json, JSON.stringify({ ...result, processed: new Date().toISOString() }) + '\n');
         const seen = Object.entries(result.seen)
             .map(([g, s]) => `${g} ${s.toFixed(2)}`)
             .join(', ');
-        log(`${cam.name}: ${name}: ${result.keyframes} keyframes, ${Math.round((Date.now() - t0) / 1000)}s${seen ? ' -- ' + seen : ''}`);
+        log(`${cam.name}: ${name}: ${detector}, ${result.keyframes} keyframes, ${Math.round((Date.now() - t0) / 1000)}s${seen ? ' -- ' + seen : ''}`);
+        tally(cam, stamp, result);
         return !!seen;
     } catch (e) {
         failed.add(clip);
         log(`${cam.name}: ${name}: FAILED: ${e.message}`);
+        tally(cam, stamp, null);
         return false;
+    }
+}
+
+// ------------------------------------------------------------------------------------------ report
+
+// Once a day, at REPORT_AT, what was done since the last time goes to MQTT, <topic>/<YYYYMMDD>: per camera and
+// in all, the clips, their length, and how many had each group seen. annkepull brings clips every 6 hours, so
+// the report waits for a time of day rather than going each time they are done: one a day, after the
+// morning's pull (04:00-04:30 and some minutes; its clips done by ~05:15). The wait between looks ends at that
+// time, so there is one more look for clips first; if clips are still being done, it goes when they are.
+// What it has so far is kept in STATE_DIRECTORY, so a restart in the day does not lose it.
+// mqtt-watchdog's alerts are states (a field holding a value) rather than events, so a report with people or
+// animals in it is sent twice, people_or_animals true and then false, as zigbee's test button does: one
+// notification each time, and nothing left held.
+let report = null, // since the last one
+    reported = ''; // the day the last one went (YYYYMMDD)
+const newCount = () => ({ clips: 0, seconds: 0, failed: 0, ...Object.fromEntries(GROUPS.map((g) => [g, 0])) });
+
+// REPORT_AT on the day of d
+function reportTime(d) {
+    const [h, m] = REPORT_AT.split(':').map(Number);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, m);
+}
+const reportDue = (now = new Date()) => !REPORT_AT || (now >= reportTime(now) && reported !== dayOf(now));
+// ms to the next report time
+function untilReport(now = new Date()) {
+    if (!REPORT_AT) return Infinity;
+    const t = reportTime(now);
+    return (t > now ? t : reportTime(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1))) - now;
+}
+
+function loadReport() {
+    try {
+        ({ reported, report } = JSON.parse(fs.readFileSync(REPORT_STATE, 'utf8')));
+    } catch {
+        // none kept: the first report goes at the next report time, not at once
+        if (REPORT_AT && new Date() >= reportTime(new Date())) reported = dayOf(new Date());
+    }
+}
+function saveReport() {
+    if (REPORT_STATE) writeAtomic(REPORT_STATE, JSON.stringify({ reported, report }) + '\n');
+}
+
+function tally(cam, stamp, result) {
+    if (!MQTT_SERVER) return;
+    report ??= { from: stamp, to: stamp, total: newCount(), cameras: {} };
+    if (stamp < report.from) report.from = stamp;
+    if (stamp > report.to) report.to = stamp;
+    for (const c of [report.total, (report.cameras[cam.name] ??= newCount())])
+        if (!result) c.failed++;
+        else {
+            c.clips++;
+            c.seconds += result.duration || 0;
+            for (const g of Object.keys(result.seen)) c[g]++;
+        }
+    saveReport();
+}
+
+// "1h23m", "12m", "40s"
+const hours = (s) => {
+    const r = Math.round(s),
+        m = Math.round(r / 60);
+    return r < 60 ? `${r}s` : m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${pad(m % 60)}m`;
+};
+// "46 clips, 1h23m: people 2, animals 1"
+const counted = (c, groups) =>
+    `${c.clips} clip${c.clips === 1 ? '' : 's'}, ${hours(c.seconds)}: ${
+        groups
+            .filter((g) => c[g])
+            .map((g) => `${g} ${c[g]}`)
+            .join(', ') || 'nothing seen'
+    }${c.failed ? ` (${c.failed} failed)` : ''}`;
+
+// what was done since the last report, if anything; either way the day's is done
+async function sendReport() {
+    const r = report;
+    report = null;
+    reported = dayOf(new Date());
+    saveReport();
+    if (r) await publishReport(r);
+}
+
+async function publishReport(r) {
+    const cams = CAMERAS.filter((c) => r.cameras[c.name]);
+    for (const c of [r.total, ...Object.values(r.cameras)]) c.seconds = Math.round(c.seconds);
+    const message = {
+        day: dayOf(new Date()),
+        from: r.from,
+        to: r.to,
+        ...r.total,
+        cameras: r.cameras,
+        summary: [
+            `all ${counted(r.total, [...new Set(cams.flatMap((c) => c.groups))])}`,
+            ...cams.map((c) => `${c.name} ${counted(r.cameras[c.name], c.groups)}`),
+        ].join('\n'),
+        people_or_animals: r.total.people + r.total.animals > 0,
+    };
+    const topic = `${MQTT_TOPIC}/${message.day}`;
+    const lines = [JSON.stringify(message)].concat(message.people_or_animals ? [JSON.stringify({ ...message, people_or_animals: false })] : []);
+    try {
+        const url = new URL(MQTT_SERVER.includes('://') ? MQTT_SERVER : `mqtt://${MQTT_SERVER}`);
+        const tls = url.protocol === 'mqtts:';
+        await run(
+            'mosquitto_pub',
+            ['-h', url.hostname, '-p', url.port || (tls ? '8883' : '1883'), ...(tls ? ['--capath', '/etc/ssl/certs'] : []), '-t', topic, '-q', '1', '-l'],
+            false,
+            lines.join('\n') + '\n'
+        );
+        log(`report: ${topic}: ${message.summary.replace(/\n/g, '; ')}`);
+    } catch (e) {
+        log(`report: ${topic}: publish to ${MQTT_SERVER} FAILED: ${e.message}`);
     }
 }
 
@@ -587,13 +784,52 @@ async function rescreen() {
     log(`screens: ${checked} results checked, ${changed} changed, in ${Math.round((Date.now() - t0) / 1000)}s`);
 }
 
+// The folder is watched (inotify) rather than listed before every clip: a change marks it to be read again,
+// and wakes the loop if it is waiting, so a file dropped in takes effect within seconds even when there is
+// nothing to do. Events are let settle for a moment first: a copy is a create and then writes.
+const SETTLE = 2000;
+let screensDirty = true, // read at the first call either way
+    watching = false,
+    wake = null; // ends the wait for the next look, when there is one
+function watchScreens() {
+    if (!SCREENS) return;
+    let settle = null;
+    try {
+        fs.watch(SCREENS, () => {
+            clearTimeout(settle);
+            settle = setTimeout(() => {
+                screensDirty = true;
+                if (wake) wake();
+            }, SETTLE);
+        }).on('error', (e) => {
+            watching = false;
+            log(`screens: watching ${SCREENS} stopped (${e.message}): read before each clip instead`);
+        });
+        watching = true;
+    } catch (e) {
+        log(`screens: cannot watch ${SCREENS} (${e.message}): read before each clip instead`);
+    }
+}
+
 async function screensChanged() {
+    if (watching && !screensDirty) return;
+    screensDirty = false;
     try {
         if (await loadScreens()) await rescreen();
     } catch (e) {
         log(`screens: ${e.message}`);
     }
 }
+
+// wait <ms>, or until the screens change
+const idle = (ms) =>
+    new Promise((resolve) => {
+        const t = setTimeout(resolve, ms);
+        wake = () => {
+            clearTimeout(t);
+            resolve();
+        };
+    }).finally(() => (wake = null));
 
 // ------------------------------------------------------------------------------------------ scan
 
@@ -628,22 +864,26 @@ async function scan() {
 // ------------------------------------------------------------------------------------------ main
 
 (async () => {
-    session = await ort.InferenceSession.create(MODEL, { intraOpNumThreads: THREADS, interOpNumThreads: 1, logSeverityLevel: 3 });
     if (TEST_CLIPS) {
         await loadScreens();
         for (const clip of TEST_CLIPS) {
             const camName = path.basename(path.dirname(path.dirname(path.resolve(clip))));
             const cam = CAMERAS.find((c) => c.name === camName) || { name: camName, groups: GROUPS, tiles: 1, masks: null, maskStamp: '' };
+            const detector = TEST_MODEL || detectorFor(RE_CLIP.exec(path.basename(clip))?.[1] || '');
             const t0 = Date.now(),
-                { result } = await detectClip(cam, clip);
+                { result } = await detectClip(cam, clip, detector);
             console.log(JSON.stringify({ clip, secs: Math.round((Date.now() - t0) / 1000), ...result }));
         }
         return;
     }
     log(
         `annkedetect: ${CAMERAS.map((c) => `${c.name}=${c.groups.join('+')}${c.tiles > 1 ? `/tiles ${c.tiles}` : ''}`).join(' ')} in ${ARCHIVE}` +
-            `${DAYS ? `, last ${DAYS} days` : ''}, threshold ${THRESHOLD}, masks ${MASKS || 'none'}, screens ${SCREENS || 'none'}`
+            `${DAYS ? `, last ${DAYS} days` : ''}, threshold ${THRESHOLD}, masks ${MASKS || 'none'}, screens ${SCREENS || 'none'}` +
+            `, detector yolox${YOLO26_FROM ? `, yolo26 for clips from ${YOLO26_FROM}` : ''}` +
+            `, reports ${MQTT_SERVER ? `to ${MQTT_SERVER} ${MQTT_TOPIC}/<day>${REPORT_AT ? ` at ${REPORT_AT}` : ''}` : 'none'}`
     );
+    if (MQTT_SERVER) loadReport();
+    watchScreens();
     for (;;) {
         await screensChanged();
         let todo = [];
@@ -653,7 +893,8 @@ async function scan() {
             log(`annkedetect: scan: ${e.message}`);
         }
         if (!todo.length) {
-            await sleep(RESCAN * 1000);
+            if (MQTT_SERVER && reportDue()) await sendReport();
+            await idle(Math.min(RESCAN * 1000, untilReport() + 1000));
             continue;
         }
         log(`annkedetect: ${todo.length} clips to do, ${todo[0].stamp.slice(0, 8)} back to ${todo.at(-1).stamp.slice(0, 8)}`);
