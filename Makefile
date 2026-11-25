@@ -2,6 +2,7 @@
 ##
 
 TARGET=annkescan
+REALTIME=annkescan-realtime
 HOSTNAME:=$(shell hostname)
 CFG_SRC:=$(if $(wildcard $(TARGET).$(HOSTNAME).cfg),$(TARGET).$(HOSTNAME).cfg,$(TARGET).cfg)
 
@@ -33,12 +34,12 @@ $(MODEL_YOLO26):
 node_modules: package.json
 	npm install --no-audit --no-fund --ignore-scripts
 	touch node_modules
-check: $(TARGET) widewatch
+check: $(TARGET) $(REALTIME)
 	node --check $(TARGET)
-	node --check widewatch
+	node --check $(REALTIME)
 	@echo "syntax OK"
 format:
-	prettier --write $(TARGET) widewatch
+	prettier --write $(TARGET) $(REALTIME)
 # what clips would get, writing nothing: make test CLIP="/opt/storage/camera/side/<YYYYMMDD>/recording_<...>.mp4 ..."
 # (MODEL=yolox or yolo26 for that detector rather than the one the clip's time gets)
 test: $(TARGET) $(MODELS) node_modules
@@ -68,15 +69,16 @@ define install_service_systemd
 endef
 # the tool, its npm dependencies and the models, in DIR_LIB; of ONNX Runtime's prebuilt binaries only
 # linux/x64 is kept (the others are ~240 MB)
-install_target: $(TARGET) $(MODELS) package.json package-lock.json
+install_target: $(TARGET) $(REALTIME) $(MODELS) package.json package-lock.json
 	install -d $(DIR_LIB)/models
-	install -m 755 $(TARGET) $(DIR_LIB)/$(TARGET)
+	install -m 755 $(TARGET) $(REALTIME) $(DIR_LIB)/
 	install -m 644 package.json package-lock.json $(DIR_LIB)/
 	install -m 644 $(MODELS) $(DIR_LIB)/models/
 	cd $(DIR_LIB) && npm ci --omit=dev --no-audit --no-fund --ignore-scripts
 	rm -rf $(DIR_LIB)/node_modules/onnxruntime-node/bin/napi-v*/darwin $(DIR_LIB)/node_modules/onnxruntime-node/bin/napi-v*/win32 \
 		$(DIR_LIB)/node_modules/onnxruntime-node/bin/napi-v*/linux/arm64
 	ln -sf $(DIR_LIB)/$(TARGET) $(DIR_INSTALL)/$(INSTALL)
+	ln -sf $(DIR_LIB)/$(REALTIME) $(DIR_INSTALL)/$(REALTIME)
 install_default: $(CFG_SRC)
 	@echo "installing config from $(CFG_SRC)"
 	install -m 644 $(CFG_SRC) $(DIR_DEFAULT)/$(INSTALL)
@@ -84,13 +86,16 @@ install_storage: $(TARGET)-storage.service
 	$(call install_depend_systemd,$(TARGET)-storage,$(INSTALL)-storage)
 install_service: $(TARGET).service
 	$(call install_service_systemd,$(TARGET),$(INSTALL))
-install: check install_target install_default install_storage install_service
+install_realtime: $(REALTIME).service
+	$(call install_service_systemd,$(REALTIME),$(REALTIME))
+install: check install_target install_default install_storage install_service install_realtime
 restart:
-	systemctl restart $(INSTALL)
+	systemctl restart $(INSTALL) $(REALTIME)
 status:
-	@systemctl --no-pager --lines=0 status $(INSTALL) || true
-	@journalctl -u $(INSTALL) -n 20 --no-pager -o cat
-.PHONY: install install_target install_default install_storage install_service
+	@systemctl --no-pager --lines=0 status $(INSTALL) $(REALTIME) || true
+	@journalctl -u $(INSTALL) -n 10 --no-pager -o cat
+	@journalctl -u $(REALTIME) -n 10 --no-pager -o cat
+.PHONY: install install_target install_default install_storage install_service install_realtime
 .PHONY: restart status
 
 ##

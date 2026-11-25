@@ -1,0 +1,696 @@
+#!/usr/bin/env node
+//
+// annkescan-realtime -- vehicles on the wide camera's stills, as they come: whether one is there, published
+// as soon as each still is looked at (for vader's page, its alerts, and anything else), and kept beside the
+// still. Grown from widewatch, the trial that ran by hand from 2026-10-28.
+//
+// The wide camera has no clips: rtsptomqtt on vader publishes a still every 30 s (<in>/imagedata, then
+// <in>/metadata with its time), workshop's mosquitto bridges them in, and the archiver keeps them as
+// <snapshots>/<YYYYMMDD>/snapshot_<time>.jpg (the time UTC). For each still:
+//   - damage: the camera sometimes cuts a keyframe short, and the frame below the cut comes out flat (pale) or
+//     in magenta or purple blocks. Looked for in the lower two thirds of a small copy of the whole frame: more
+//     than DAMAGE_MAGENTA of it with green under both red and blue (real stills are green, or grey under the
+//     IR), or flatter than DAMAGE_FLAT. A damaged still is not looked at further, nor compared with. (The
+//     trial went by size, much smaller than the last few: right for the daylight damage, but at night in fog
+//     whole stills shrink as much, and 45 of its 69 in ten days were whole; it also missed 2.)
+//   - change in the zone since the last good still: blocks whose brightness moved, once the zone's overall
+//     shift (light) is taken out. None, and it is not searched: whatever was there still is.
+//   - the detector (YOLO26) over the zone and a margin above it (a car's body over its wheels): 2 searches;
+//     vehicles whose bottom centre (the wheels) is white in <masks>/wide-mask-cars.png, at the threshold or
+//     better. One with a quarter or more of the change blocks under it changed has moved (or come).
+// and from that, whether vehicles are present -- not how many: one van comes out as two boxes (the whole of
+// it, and its cab), and parked cars hide each other:
+//   - absent, and a vehicle moved: present, one arrived. A vehicle found where nothing changed is not one:
+//     the trial's false positives were all like that (a dark patch at the top of the zone, at dusk or night,
+//     3 in 5000 searches).
+//   - present, and nothing found, where the vehicles were changed: leaving. The next still is searched
+//     whatever its change, and if nothing is found again, they left (as of the first). Nothing found where
+//     nothing changed is the detector missing a parked car: still present.
+//   - otherwise as it was. On the first still there is no change to go by, so whatever is found.
+//
+// Each still, <topic> (retained: it is also the heartbeat, and a restart takes up from it):
+//   {"time": "<still>", "present": true, "since": "<still it changed at>", "movement": false, "still": "same",
+//    "boxes": [[x0, y0, x1, y1], ...]}
+// still is searched, same (unchanged, not searched) or damaged; movement that a vehicle moved in this one
+// (one came, or a second beside one parked, or one turning); boxes those last found while present, in the
+// still's pixels. When a vehicle is present or found, <snapshots>/<YYYYMMDD>/snapshot_<time>.json goes beside
+// the still, shaped like the clips' results:
+//   {"time", "model", "present", "since", "movement", "still", "seen": {"vehicles": 0.89},
+//    "detections": [{"class", "score", "box", "moved"}], "change": {"blocks", "of"}}
+// (seen carried from the last search on a still not searched; detections only on one searched). Most of the
+// year there are none, so most stills have no file: that it is running is the heartbeat's to say.
+//
+// In <log>: latest.jpg, the last still's zone with the boxes; the stills where something was found, kept like
+// that in <YYYYMMDD>/<time>.jpg; and realtime.jsonl, a line per still. The journal gets the stills searched,
+// the damaged, the arrivals and departures, and a summary every hour.
+//
+// Config: annkescan's (key=value): masks, models, threshold, threads, mqtt-server (default mqtt://localhost),
+//   realtime-in (snapshots), realtime-topic (camera/wide), realtime-snapshots (the archiver's folder; empty: no
+//   files beside the stills), realtime-log (empty: none).
+// Usage: annkescan-realtime [config] [--broker <url>] [--in <prefix>] [--topic <topic>] [--snapshots <dir>] [--log <dir>]
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const ort = require('onnxruntime-node');
+const mqtt = require('mqtt');
+
+// ------------------------------------------------------------------------------------------ config
+
+const args = process.argv.slice(2);
+const opt = (name, d) => {
+    const i = args.indexOf(`--${name}`);
+    return i < 0 || args[i + 1] === undefined ? d : args[i + 1];
+};
+const CFG_FILE = args.find((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--'))) || '/etc/default/annkescan';
+const cfg = {};
+try {
+    for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
+        const m = /^\s*([a-z][a-z0-9-]*)\s*=\s*(.*?)\s*$/.exec(line);
+        if (m) cfg[m[1]] = m[2];
+    }
+} catch (e) {
+    console.error(`annkescan-realtime: ${CFG_FILE}: ${e.message}`);
+    process.exit(1);
+}
+const MASK = path.join(cfg['masks'] || path.join(__dirname, `annkescan.${os.hostname()}`), 'wide-mask-cars.png');
+const MODELS = cfg['models'] || path.join(__dirname, 'models');
+const THRESHOLD = cfg['threshold'] && !isNaN(Number(cfg['threshold'])) ? Number(cfg['threshold']) : 0.4;
+const THREADS = cfg['threads'] && !isNaN(Number(cfg['threads'])) ? Number(cfg['threads']) : 2;
+const BROKER = opt('broker', cfg['mqtt-server'] || 'mqtt://localhost');
+const IN = opt('in', cfg['realtime-in'] || 'snapshots');
+const TOPIC = opt('topic', cfg['realtime-topic'] || 'camera/wide');
+const SNAPSHOTS = opt('snapshots', cfg['realtime-snapshots'] || '');
+const LOG = opt('log', cfg['realtime-log'] || '');
+
+const SIZE = 640; // the models' input, square
+const OVERLAP = 64; // between tiles, so a car on a seam is whole in one of them
+const STEP = SIZE - OVERLAP;
+const MARGIN = 128 / 1888; // above the zone, of the frame's height: the far end's cars stand above their wheels
+const BLOCK = 32; // change blocks, in pixels of the working size (~64 of the still)
+const CHANGE = 15; // a block's brightness change (of 255) that counts, after the zone's own shift
+const LIGHT = 0.5; // more than this share of the blocks changed: shown as light (headlights, the IR), searched all the same
+const MOVED = 0.25; // of the change blocks under a vehicle, the share that changed for it to have come (or moved)
+// damage, in the lower two thirds of a 64x28 copy of the whole still: in ten days, the damaged had 0.4 or more
+// magenta or were flatter than 4.1; the whole (day, night, fog) had none and were 9 or more
+const THUMB_W = 64,
+    THUMB_H = 28;
+const DAMAGE_MAGENTA = 0.2; // share of it with green under both red and blue
+const DAMAGE_FLAT = 6; // mean difference between neighbours (of 255)
+const VEHICLES = [
+    [1, 'bicycle'],
+    [2, 'car'],
+    [3, 'motorcycle'],
+    [5, 'bus'],
+    [7, 'truck'],
+];
+const COLOUR = 'magenta';
+
+// ------------------------------------------------------------------------------------------ util
+
+const pad = (n) => String(n).padStart(2, '0');
+const clock = (d = new Date()) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+const utcStamp = (d) => d.toISOString().replace(/\D/g, '').slice(0, 14);
+const stampDate = (s) => new Date(Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8), +s.slice(8, 10), +s.slice(10, 12), +s.slice(12, 14)));
+const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
+const say = (s) => console.log(s); // journald stamps it
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// "1h28m", "12m", "40s"
+const lasted = (ms) => {
+    const s = Math.round(ms / 1000),
+        m = Math.round(s / 60);
+    return s < 60 ? `${s}s` : m < 60 ? `${m}m` : `${Math.floor(m / 60)}h${pad(m % 60)}m`;
+};
+
+function run(cmd, argv, input) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(cmd, argv, { timeout: 120000 });
+        const out = [],
+            err = [];
+        child.stdout.on('data', (d) => out.push(d));
+        child.stderr.on('data', (d) => err.push(d));
+        child.stdin.on('error', () => {}); // an ffmpeg that gave up early
+        child.on('error', reject);
+        child.on('close', (code, signal) => {
+            if (code === 0) return resolve(Buffer.concat(out));
+            reject(new Error(Buffer.concat(err).toString().trim().split('\n').pop() || `${cmd} exited ${code ?? signal}`));
+        });
+        child.stdin.end(input);
+    });
+}
+
+function writeAtomic(file, data) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.part`, data);
+    fs.renameSync(`${file}.part`, file);
+}
+
+// width and height from a JPEG's frame header, without decoding it
+function jpegSize(buf) {
+    for (let i = 2; i + 9 < buf.length;) {
+        if (buf[i] !== 0xff) return null;
+        const marker = buf[i + 1];
+        if (marker === 0xff) {
+            i++;
+            continue;
+        }
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc)
+            return { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
+        i += 2 + buf.readUInt16BE(i + 2);
+    }
+    return null;
+}
+
+// ------------------------------------------------------------------------------------------ detector
+
+// YOLO26s (COCO), as in annkescan
+
+const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
+function iou(a, b) {
+    const inter = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+    return inter / (area(a) + area(b) - inter);
+}
+function nms(dets) {
+    const keep = [];
+    for (const d of [...dets].sort((a, b) => b.score - a.score)) if (!keep.some((k) => k.name === d.name && iou(k.box, d.box) >= 0.5)) keep.push(d);
+    return keep;
+}
+
+const MODEL_FILE = 'yolo26s.onnx',
+    MODEL_NAME = 'yolo26s (coco, onnx-community)';
+let session;
+
+// end to end (no anchors, no suppression needed): per query, 80 class logits, and a box (centre and size as
+// fractions of the input); boxes in tile pixels
+function decode(outputs) {
+    const logits = outputs.logits.data,
+        boxes = outputs.pred_boxes.data,
+        found = [];
+    for (let q = 0; q < outputs.logits.dims[1]; q++)
+        for (const [id, name] of VEHICLES) {
+            const score = 1 / (1 + Math.exp(-logits[q * 80 + id]));
+            if (score <= THRESHOLD) continue;
+            const x = boxes[q * 4] * SIZE,
+                y = boxes[q * 4 + 1] * SIZE,
+                w = boxes[q * 4 + 2] * SIZE,
+                h = boxes[q * 4 + 3] * SIZE;
+            found.push({ name, score, box: [x - w / 2, y - h / 2, x + w / 2, y + h / 2] });
+        }
+    return found;
+}
+
+// the model's input from a tile of a BGR frame: planar RGB, 0..1, padded with 114 grey
+function tensor(frame, W, H, tx, ty) {
+    const data = new Float32Array(3 * SIZE * SIZE).fill(114 / 255),
+        plane = SIZE * SIZE;
+    const tw = Math.min(SIZE, W - tx),
+        th = Math.min(SIZE, H - ty);
+    for (let y = 0; y < th; y++)
+        for (let x = 0, src = ((ty + y) * W + tx) * 3, dst = y * SIZE; x < tw; x++, src += 3, dst++) {
+            data[dst] = frame[src + 2] / 255;
+            data[plane + dst] = frame[src + 1] / 255;
+            data[2 * plane + dst] = frame[src] / 255;
+        }
+    return new ort.Tensor('float32', data, [1, 3, SIZE, SIZE]);
+}
+
+function tileStarts(len) {
+    if (len <= SIZE) return [0];
+    return Array.from({ length: Math.ceil((len - OVERLAP) / STEP) }, (_, i) => Math.min(i * STEP, len - SIZE));
+}
+
+// ------------------------------------------------------------------------------------------ zone
+
+const mask = { w: 0, h: 0, bits: null, zone: null }; // the mask at a quarter size, and the bounds of its white (fractions)
+
+async function loadMask() {
+    const [w, h] = (await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', MASK]))
+        .toString()
+        .trim()
+        .split(',')
+        .map(Number);
+    mask.w = Math.round(w / 4);
+    mask.h = Math.round(h / 4);
+    mask.bits = await run('ffmpeg', ['-v', 'error', '-i', MASK, '-vf', `scale=${mask.w}:${mask.h}:flags=neighbor`, '-f', 'rawvideo', '-pix_fmt', 'gray', '-']);
+    const z = { x0: 1, y0: 1, x1: 0, y1: 0 };
+    for (let y = 0; y < mask.h; y++)
+        for (let x = 0; x < mask.w; x++)
+            if (mask.bits[y * mask.w + x] > 127) {
+                z.x0 = Math.min(z.x0, x / mask.w);
+                z.x1 = Math.max(z.x1, (x + 1) / mask.w);
+                z.y0 = Math.min(z.y0, y / mask.h);
+                z.y1 = Math.max(z.y1, (y + 1) / mask.h);
+            }
+    if (z.x1 <= z.x0) throw new Error(`${MASK}: no white in it`);
+    mask.zone = z;
+    return { w, h };
+}
+
+// the box's bottom centre, in a w x h still, white in the mask
+function inZone(box, w, h) {
+    const x = Math.min(mask.w - 1, Math.max(0, Math.floor((((box[0] + box[2]) / 2) * mask.w) / w)));
+    const y = Math.min(mask.h - 1, Math.max(0, Math.floor((box[3] * mask.h) / h)));
+    return mask.bits[y * mask.w + x] > 127;
+}
+
+// for a still's size: the crop (the zone and the margin above), the working size (one row of tiles), the
+// tiles, and the change blocks (those at least a quarter in the zone)
+const geometries = new Map();
+function geometry(w, h) {
+    const key = `${w}x${h}`;
+    if (geometries.has(key)) return geometries.get(key);
+    const z = mask.zone;
+    const cx = even(z.x0 * w),
+        cy = even(Math.max(0, (z.y0 - MARGIN) * h));
+    const cw = Math.min(even((z.x1 - z.x0) * w), w - cx),
+        ch = Math.min(even(z.y1 * h - cy), h - cy);
+    const H = SIZE,
+        W = even((SIZE * cw) / ch);
+    const g = { w, h, cx, cy, cw, ch, W, H, sx: cw / W, sy: ch / H, xs: tileStarts(W), ys: tileStarts(H), blocks: [] };
+    for (let by = 0; by + BLOCK <= H; by += BLOCK)
+        for (let bx = 0; bx + BLOCK <= W; bx += BLOCK) {
+            let inside = 0;
+            for (let y = by; y < by + BLOCK; y += 4)
+                for (let x = bx; x < bx + BLOCK; x += 4) if (inZone([cx + x * g.sx, 0, cx + x * g.sx, cy + y * g.sy], w, h)) inside++;
+            if (inside >= (BLOCK / 4) ** 2 / 4) g.blocks.push([bx, by]);
+        }
+    geometries.set(key, g);
+    return g;
+}
+
+// each block's mean brightness
+function blockMeans(frame, g) {
+    return g.blocks.map(([bx, by]) => {
+        let s = 0;
+        for (let y = by; y < by + BLOCK; y += 2)
+            for (let x = bx; x < bx + BLOCK; x += 2) {
+                const i = (y * g.W + x) * 3;
+                s += frame[i] * 0.114 + frame[i + 1] * 0.587 + frame[i + 2] * 0.299;
+            }
+        return s / (BLOCK / 2) ** 2;
+    });
+}
+
+// whether a box's place changed (a vehicle came, moved or went): of the change blocks it (in the still)
+// overlaps, MOVED or more changed, and one at least
+function movedIn(box, g, changed) {
+    let n = 0,
+        c = 0;
+    g.blocks.forEach(([bx, by], i) => {
+        const x = g.cx + bx * g.sx,
+            y = g.cy + by * g.sy;
+        if (x < box[2] && x + BLOCK * g.sx > box[0] && y < box[3] && y + BLOCK * g.sy > box[1]) {
+            n++;
+            c += changed[i];
+        }
+    });
+    return c > 0 && c >= MOVED * n;
+}
+
+// the lower two thirds of a THUMB_W x THUMB_H RGB copy of the still: the share with green under both red and
+// blue, and the mean difference between neighbours; and, for the log, its colour (0 under the IR, ~15-21 by day)
+function damageOf(rgb) {
+    let magenta = 0,
+        n = 0,
+        flat = 0,
+        colour = 0;
+    for (let y = Math.floor(THUMB_H / 3); y < THUMB_H; y++)
+        for (let x = 0; x < THUMB_W; x++) {
+            const i = (y * THUMB_W + x) * 3,
+                s = rgb[i] + rgb[i + 1] + rgb[i + 2];
+            n++;
+            colour += (Math.abs(rgb[i] - rgb[i + 1]) + Math.abs(rgb[i + 2] - rgb[i + 1])) / 2;
+            if (rgb[i + 1] < Math.min(rgb[i], rgb[i + 2]) - 8) magenta++;
+            if (x + 1 < THUMB_W) flat += Math.abs(rgb[i + 3] + rgb[i + 4] + rgb[i + 5] - s) / 3;
+            if (y + 1 < THUMB_H) {
+                const j = i + THUMB_W * 3;
+                flat += Math.abs(rgb[j] + rgb[j + 1] + rgb[j + 2] - s) / 3;
+            }
+        }
+    return { magenta: Math.round((magenta / n) * 100) / 100, flat: Math.round((flat / n) * 10) / 10, colour: Math.round((colour / n) * 10) / 10 };
+}
+
+// ------------------------------------------------------------------------------------------ a still
+
+async function detect(frame, g) {
+    const t0 = Date.now(),
+        found = [];
+    for (const ty of g.ys)
+        for (const tx of g.xs) {
+            const outputs = await session.run({ pixel_values: tensor(frame, g.W, g.H, tx, ty) });
+            for (const d of decode(outputs))
+                found.push({
+                    ...d,
+                    box: [g.cx + (d.box[0] + tx) * g.sx, g.cy + (d.box[1] + ty) * g.sy, g.cx + (d.box[2] + tx) * g.sx, g.cy + (d.box[3] + ty) * g.sy],
+                });
+        }
+    const kept = nms(found).filter((d) => inZone(d.box, g.w, g.h));
+    return { ms: Date.now() - t0, found: kept.map((d) => ({ class: d.name, score: Math.round(d.score * 100) / 100, box: d.box.map(Math.round) })) };
+}
+
+// the zone at the working size, with the boxes, as a JPEG at <file> (and at <copy>, when given)
+async function draw(frame, g, found, file, copy) {
+    const boxes = found.map((d) => {
+        const x = Math.round((d.box[0] - g.cx) / g.sx),
+            y = Math.round((d.box[1] - g.cy) / g.sy);
+        const w = Math.max(4, Math.round((d.box[2] - d.box[0]) / g.sx)),
+            h = Math.max(4, Math.round((d.box[3] - d.box[1]) / g.sy));
+        return `drawbox=x=${x}:y=${y}:w=${w}:h=${h}:color=${COLOUR}:t=3`;
+    });
+    const jpg = await run(
+        'ffmpeg',
+        ['-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', `${g.W}x${g.H}`, '-i', '-']
+            .concat(boxes.length ? ['-vf', boxes.join(',')] : [])
+            .concat(['-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '4', '-f', 'image2pipe', '-']),
+        frame
+    );
+    writeAtomic(file, jpg);
+    if (copy) writeAtomic(copy, jpg);
+}
+
+// whether vehicles are present, as of the last still (taken up from the retained <topic> at a restart)
+const state = {
+    present: false,
+    since: null, // the still it changed at
+    boxes: [], // the vehicles last found while present
+    seen: 0, // their best score
+    leaving: null, // the still nothing was found at, where they were changed: the next is searched to be sure
+};
+
+// from what was found (and where it changed), the presence: r.present, r.since, r.movement, r.event (and
+// r.stayed, from when and how long, when they left)
+function decide(r, g, changed) {
+    const found = r.yolo26?.found;
+    r.movement = false;
+    r.event = null;
+    if (found) {
+        r.movement = found.some((f) => f.moved);
+        const was = state.present,
+            from = state.since;
+        if (r.verdict === 'first') state.present = found.length > 0;
+        else if (state.leaving) {
+            if (found.length) r.event = 'missed';
+            else state.present = false;
+        } else if (!was) state.present = r.movement;
+        else if (!found.length) {
+            if (!state.boxes.length || state.boxes.some((b) => movedIn(b, g, changed))) {
+                state.leaving = r.stamp;
+                r.event = 'leaving';
+            } else r.event = 'missed';
+        }
+        if (state.present !== was || state.since === null) {
+            state.since = !state.present && state.leaving ? state.leaving : r.stamp;
+            if (state.present !== was && r.verdict !== 'first') r.event = state.present ? 'arrived' : 'left'; // on the first, it was there already
+            if (r.event === 'left' && from) r.stayed = { from, lasted: lasted(stampDate(state.since) - stampDate(from)) };
+        }
+        if (r.event !== 'leaving') state.leaving = null;
+        if (state.present && found.length) {
+            state.boxes = found.map((f) => f.box);
+            state.seen = Math.max(...found.map((f) => f.score));
+        }
+        if (!state.present) state.boxes = [];
+    }
+    r.present = state.present;
+    r.since = state.since;
+}
+
+let ref = null; // the last good still's block means
+
+async function handle(job) {
+    for (let i = 0; i < 20 && !job.stamp; i++) await sleep(100); // its metadata, with its time, comes just after it
+    const t0 = Date.now(),
+        stamp = job.stamp || utcStamp(new Date(job.arrived));
+    const r = { arrived: new Date(job.arrived).toISOString(), stamp, size: job.jpg.length, skipped: job.skipped };
+    const dims = jpegSize(job.jpg);
+    let frame = null,
+        g = null;
+    if (dims) {
+        g = geometry(dims.w, dims.h);
+        const [zone, thumb] = await Promise.all([
+            run(
+                'ffmpeg',
+                [
+                    '-v',
+                    'error',
+                    '-i',
+                    '-',
+                    '-vf',
+                    `crop=${g.cw}:${g.ch}:${g.cx}:${g.cy},scale=${g.W}:${g.H}:flags=area`,
+                    '-f',
+                    'rawvideo',
+                    '-pix_fmt',
+                    'bgr24',
+                    '-',
+                ],
+                job.jpg
+            ),
+            // decoded at an eighth of the size: plenty for this, and quick
+            run(
+                'ffmpeg',
+                ['-v', 'error', '-lowres', '3', '-i', '-', '-vf', `scale=${THUMB_W}:${THUMB_H}:flags=area`, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+                job.jpg
+            ),
+        ]);
+        if (zone.length !== g.W * g.H * 3) throw new Error(`decoded ${zone.length} bytes, not ${g.W * g.H * 3}`);
+        if (thumb.length !== THUMB_W * THUMB_H * 3) throw new Error(`decoded ${thumb.length} bytes of the small copy, not ${THUMB_W * THUMB_H * 3}`);
+        frame = zone;
+        r.damage = damageOf(thumb);
+    }
+    r.damaged = !dims || r.damage.magenta > DAMAGE_MAGENTA || r.damage.flat < DAMAGE_FLAT;
+    r.decodeMs = Date.now() - t0;
+    if (r.damaged) {
+        r.verdict = 'damaged';
+        decide(r);
+        r.tookMs = Date.now() - job.arrived;
+        return r;
+    }
+    const means = blockMeans(frame, g);
+    // for the log: the zone's brightness (of 255) and the still's colour, to see each verdict against the light
+    r.light = { level: Math.round(means.reduce((a, v) => a + v, 0) / means.length), colour: r.damage.colour };
+    let changed = null;
+    if (ref && ref.length === means.length) {
+        const d = means.map((v, i) => v - ref[i]),
+            shift = [...d].sort((a, b) => a - b)[d.length >> 1],
+            dev = d.map((v) => Math.abs(v - shift));
+        changed = dev.map((v) => v > CHANGE);
+        r.change = { max: Math.round(Math.max(...dev)), blocks: changed.filter(Boolean).length, of: means.length, shift: Math.round(shift) };
+        r.verdict = r.change.blocks === 0 ? 'same' : r.change.blocks > LIGHT * means.length ? 'light' : 'change';
+    } else r.verdict = 'first';
+    ref = means;
+    if (r.verdict !== 'same' || state.leaving) {
+        r.yolo26 = await detect(frame, g);
+        if (changed) for (const f of r.yolo26.found) f.moved = movedIn(f.box, g, changed);
+    }
+    decide(r, g, changed);
+    r.tookMs = Date.now() - job.arrived;
+    const found = r.yolo26?.found || [];
+    if (LOG) await draw(frame, g, found, path.join(LOG, 'latest.jpg'), found.length ? path.join(LOG, stamp.slice(0, 8), `${stamp}.jpg`) : null);
+    return r;
+}
+
+// ------------------------------------------------------------------------------------------ out
+
+const stillOf = (r) => (r.damaged ? 'damaged' : r.yolo26 ? 'searched' : 'same');
+
+// the heartbeat, retained
+const heartbeat = (r) => ({
+    time: r.stamp,
+    present: r.present,
+    since: r.since,
+    movement: r.movement,
+    still: stillOf(r),
+    boxes: state.present ? state.boxes : [],
+});
+
+// beside the still, when a vehicle is present or found
+function result(r) {
+    const found = r.yolo26?.found || [];
+    if (!r.present && !found.length) return null;
+    const seen = found.length ? Math.max(...found.map((f) => f.score)) : r.present ? state.seen : 0;
+    return {
+        time: r.stamp,
+        model: 'yolo26',
+        present: r.present,
+        since: r.since,
+        movement: r.movement,
+        still: stillOf(r),
+        seen: seen ? { vehicles: seen } : {},
+        ...(r.yolo26 ? { detections: found } : {}),
+        ...(r.change ? { change: { blocks: r.change.blocks, of: r.change.of } } : {}),
+    };
+}
+
+// the journal: the stills searched, the damaged, and the changes of presence
+const shown = (d) =>
+    d.found.length
+        ? d.found
+              .slice(0, 3)
+              .map((f) => `${f.class} ${f.score.toFixed(2)}${f.moved === true ? ' moved' : f.moved === false ? ' static' : ''}`)
+              .join(', ') + (d.found.length > 3 ? ` +${d.found.length - 3}` : '')
+        : '-';
+const EVENTS = {
+    arrived: () => '  << arrived',
+    left: (r) => `  << left${r.stayed ? ` (there from ${r.stayed.from}, ${r.stayed.lasted})` : ''}`,
+    leaving: () => '  -- nothing where they were: the next is searched',
+    missed: () => '  -- not found, still present',
+};
+function line(r) {
+    if (r.error) return `${r.stamp}: FAILED: ${r.error}`;
+    if (r.damaged) return `${r.stamp} damaged (magenta ${r.damage?.magenta}, flat ${r.damage?.flat})`;
+    if (!r.yolo26) return null;
+    const zone = r.change ? `${r.verdict} ${r.change.blocks}/${r.change.of}` : r.verdict;
+    const event = r.event ? EVENTS[r.event](r) : r.present ? ' (present)' : '';
+    return `${r.stamp} ${zone} | ${shown(r.yolo26)} | ${secs(r.yolo26.ms)} of ${secs(r.tookMs)}${r.skipped ? ` (${r.skipped} skipped before)` : ''}${event}`;
+}
+
+// a summary each hour (of the clock), and at the end
+const newStats = () => ({ from: new Date(), stills: 0, damaged: 0, skipped: 0, errors: 0, done: 0, took: 0, max: 0, searched: 0, arrived: 0, left: 0 });
+let hour = newStats(),
+    total = newStats();
+function count(r) {
+    for (const s of [hour, total]) {
+        s.stills++;
+        s.skipped += r.skipped || 0;
+        if (r.error) s.errors++;
+        else if (r.damaged) s.damaged++;
+        else {
+            s.done++;
+            s.took += r.tookMs;
+            s.max = Math.max(s.max, r.tookMs);
+            s.searched += !!r.yolo26;
+            s.arrived += r.event === 'arrived';
+            s.left += r.event === 'left';
+        }
+    }
+}
+function summary(s, what) {
+    const each = s.done ? `; ${secs(s.took / s.done)} each (most ${secs(s.max)})` : '';
+    return (
+        `-- ${what}: ${s.stills} stills (${s.damaged} damaged, ${s.skipped} skipped, ${s.errors} failed), ${s.searched} searched${each}; ` +
+        `${s.arrived} arrived, ${s.left} left; ${state.present ? `present since ${state.since}` : 'none present'}`
+    );
+}
+function hourly() {
+    const now = new Date();
+    if (now.getHours() === hour.from.getHours() && now - hour.from < 3600000) return;
+    if (hour.stills) say(summary(hour, `${clock(hour.from).slice(0, 5)} to ${clock(now).slice(0, 5)}`));
+    hour = newStats();
+}
+
+// ------------------------------------------------------------------------------------------ main
+
+(async () => {
+    const { w, h } = await loadMask();
+    session = await ort.InferenceSession.create(path.join(MODELS, MODEL_FILE), { intraOpNumThreads: THREADS, interOpNumThreads: 1, logSeverityLevel: 3 });
+    if (LOG) fs.mkdirSync(LOG, { recursive: true });
+    const log = LOG ? fs.createWriteStream(path.join(LOG, 'realtime.jsonl'), { flags: 'a' }) : null;
+    const g = geometry(w, h),
+        z = mask.zone;
+    say(
+        `annkescan-realtime: ${BROKER} ${IN}/imagedata -> ${TOPIC}; zone ${path.basename(MASK)} ${Math.round((z.x1 - z.x0) * w)}x${Math.round((z.y1 - z.y0) * h)} at ` +
+            `${Math.round(z.x0 * w)},${Math.round(z.y0 * h)} of ${w}x${h}, ${g.cy < Math.round(z.y0 * h) ? `${Math.round(z.y0 * h) - g.cy} px above it, ` : ''}` +
+            `as ${g.W}x${g.H}: ${g.xs.length * g.ys.length} searches; ${g.blocks.length} change blocks`
+    );
+    say(
+        `annkescan-realtime: ${MODEL_NAME}, ${THREADS} threads, threshold ${THRESHOLD}; results beside the stills in ${SNAPSHOTS || '(none)'}; log in ${LOG || '(none)'}`
+    );
+
+    let busy = false,
+        pending = null,
+        latest = null,
+        skipped = 0,
+        started = false, // a still has come: what the heartbeat said is no longer wanted
+        online = null;
+    const client = mqtt.connect(BROKER, { clientId: `annkescan-realtime-${os.hostname()}-${process.pid}`, reconnectPeriod: 5000 });
+
+    async function pump() {
+        if (busy || !pending) return;
+        busy = true;
+        const job = pending;
+        pending = null;
+        job.skipped = skipped;
+        skipped = 0;
+        if (!started) {
+            started = true;
+            client.unsubscribe(TOPIC);
+        }
+        let r;
+        try {
+            r = await handle(job);
+        } catch (e) {
+            r = {
+                arrived: new Date(job.arrived).toISOString(),
+                stamp: job.stamp || utcStamp(new Date(job.arrived)),
+                size: job.jpg.length,
+                skipped: job.skipped,
+                error: e.message,
+            };
+        }
+        if (!r.error) {
+            client.publish(TOPIC, JSON.stringify(heartbeat(r)), { retain: true, qos: 0 });
+            const res = SNAPSHOTS ? result(r) : null,
+                file = (stamp) => path.join(SNAPSHOTS, stamp.slice(0, 8), `snapshot_${stamp}.json`);
+            try {
+                if (res) writeAtomic(file(r.stamp), JSON.stringify(res) + '\n');
+                // they had gone at the still that found nothing, which was written as present while it was unsure
+                if (SNAPSHOTS && r.event === 'left' && r.since !== r.stamp) fs.rmSync(file(r.since), { force: true });
+            } catch (e) {
+                say(`${r.stamp}: result: ${e.message}`);
+            }
+        }
+        hourly();
+        const l = line(r);
+        if (l) say(l);
+        if (log) log.write(JSON.stringify(r) + '\n');
+        count(r);
+        busy = false;
+        pump();
+    }
+
+    client.on('connect', () => {
+        if (online !== true) say('mqtt: connected, waiting for stills');
+        online = true;
+        // the last heartbeat (retained) first, to take up from
+        client.subscribe(started ? [`${IN}/imagedata`, `${IN}/metadata`] : [TOPIC, `${IN}/imagedata`, `${IN}/metadata`]);
+    });
+    client.on('offline', () => {
+        if (online !== false) say('mqtt: offline, retrying');
+        online = false;
+    });
+    client.on('error', (e) => say(`mqtt: ${e.message}`));
+    client.on('message', (topic, payload) => {
+        if (topic === TOPIC) {
+            if (started) return;
+            try {
+                const m = JSON.parse(payload.toString());
+                Object.assign(state, { present: !!m.present, since: m.since || null, boxes: m.present && Array.isArray(m.boxes) ? m.boxes : [] });
+                say(`annkescan-realtime: taken up from ${m.time}: ${state.present ? `present since ${state.since}` : 'none present'}`);
+            } catch {
+                /* not ours */
+            }
+        } else if (topic.endsWith('/imagedata')) {
+            if (pending) skipped++; // still busy with the one before: only the newest waits
+            pending = latest = { jpg: Buffer.from(payload), arrived: Date.now(), stamp: null };
+            pump();
+        } else if (topic.endsWith('/metadata'))
+            try {
+                const m = JSON.parse(payload.toString()); // {"time": "<YYYYMMDDHHMMSS>", "size": <bytes>}, just after its still
+                if (latest && !latest.stamp && m.size === latest.jpg.length) latest.stamp = String(m.time);
+            } catch {
+                /* not ours */
+            }
+    });
+    const stop = () => {
+        say(summary(total, `since ${total.from.toLocaleString('sv-SE').slice(0, 16)}`));
+        client.end(false, () => process.exit(0));
+        setTimeout(() => process.exit(0), 2000);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+})().catch((e) => {
+    console.error(`annkescan-realtime: ${e.message}`);
+    process.exit(1);
+});

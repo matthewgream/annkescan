@@ -1,0 +1,20 @@
+[Unit]
+Description=annkescan-realtime - vehicles on the wide camera's stills, as they come
+Documentation=file:/opt/annkescan/README.md
+Requires=annkescan-storage.service
+After=annkescan-storage.service mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/annkescan-realtime /etc/default/annkescan
+Restart=on-failure
+RestartSec=30s
+# as the stills come: at the usual priority, so ahead of annkescan's clips (idle)
+MemoryMax=1000M
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
