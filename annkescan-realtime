@@ -41,12 +41,13 @@
 // year there are none, so most stills have no file: that it is running is the heartbeat's to say.
 //
 // In <log>: latest.jpg, the last still's zone with the boxes; the stills where something was found, kept like
-// that in <YYYYMMDD>/<time>.jpg; and realtime.jsonl, a line per still. The journal gets the stills searched,
-// the damaged, the arrivals and departures, and a summary every hour.
+// that in <YYYYMMDD>/<time>.jpg, at most one each <keep> minutes while the number of vehicles stays the same (a
+// parked car is found all day: the archive has every still); and realtime.jsonl, a line per still. The journal
+// gets the stills searched, the damaged, the arrivals and departures, and a summary every hour.
 //
 // Config: annkescan's (key=value): masks, models, threshold, threads, mqtt-server (default mqtt://localhost),
 //   realtime-in (snapshots), realtime-topic (camera/wide), realtime-snapshots (the archiver's folder; empty: no
-//   files beside the stills), realtime-log (empty: none).
+//   files beside the stills), realtime-log (empty: none), realtime-keep (15 minutes; 0: every one).
 // Usage: annkescan-realtime [config] [--broker <url>] [--in <prefix>] [--topic <topic>] [--snapshots <dir>] [--log <dir>]
 
 'use strict';
@@ -84,6 +85,7 @@ const IN = opt('in', cfg['realtime-in'] || 'snapshots');
 const TOPIC = opt('topic', cfg['realtime-topic'] || 'camera/wide');
 const SNAPSHOTS = opt('snapshots', cfg['realtime-snapshots'] || '');
 const LOG = opt('log', cfg['realtime-log'] || '');
+const KEEP = (cfg['realtime-keep'] && !isNaN(Number(cfg['realtime-keep'])) ? Number(cfg['realtime-keep']) : 15) * 60000;
 
 const SIZE = 640; // the models' input, square
 const OVERLAP = 64; // between tiles, so a car on a seam is whole in one of them
@@ -418,6 +420,7 @@ function decide(r, g, changed) {
 }
 
 let ref = null; // the last good still's block means
+let kept = { time: 0, vehicles: 0 }; // the last still kept in <log>: its time, and how many vehicles were found in it
 
 async function handle(job) {
     for (let i = 0; i < 20 && !job.stamp; i++) await sleep(100); // its metadata, with its time, comes just after it
@@ -487,7 +490,13 @@ async function handle(job) {
     decide(r, g, changed);
     r.tookMs = Date.now() - job.arrived;
     const found = r.yolo26?.found || [];
-    if (LOG) await draw(frame, g, found, path.join(LOG, 'latest.jpg'), found.length ? path.join(LOG, stamp.slice(0, 8), `${stamp}.jpg`) : null);
+    // kept in <log>: a still with something found, at most one each KEEP while the number found stays the same (as
+    // found: one van can be two boxes, which only keeps one more)
+    if (found.length && (found.length !== kept.vehicles || Math.abs(stampDate(stamp) - kept.time) >= KEEP)) {
+        kept = { time: +stampDate(stamp), vehicles: found.length };
+        r.kept = true;
+    }
+    if (LOG) await draw(frame, g, found, path.join(LOG, 'latest.jpg'), r.kept ? path.join(LOG, stamp.slice(0, 8), `${stamp}.jpg`) : null);
     return r;
 }
 

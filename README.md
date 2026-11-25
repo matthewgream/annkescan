@@ -152,10 +152,11 @@ Out, each still:
 | `camera/wide` | retained: `{"time": "<still>", "present": true, "since": "<still it changed at>", "movement": false, "still": "searched", "boxes": [...]}`. `still` is `searched`, `same` or `damaged`; `movement` that a vehicle moved in this one (one came, a second beside one parked, one turning); `boxes` those last found while present, in the still's pixels. One per still, so also the heartbeat. |
 | `snapshot_<time>.json` | beside the still in the archiver's folder (`realtime-snapshots`), only when a vehicle is present or found (most of the year, none), as the clips' results: `{"time", "model", "present", "since", "movement", "still", "seen": {"vehicles": 0.89}, "detections": [...], "change": {...}}` |
 
-In `realtime-log` (`/opt/storage/disk/weather/detections` on workshop, beside the archive): `latest.jpg`, the last still's zone
-with the boxes; the stills where something was found, kept like that by day; and `realtime.jsonl`, a line
-per still. The journal has the stills searched, the damaged, the arrivals and departures, and a summary
-each hour:
+In `realtime-log` (`/opt/storage/disk/weather/detections` on workshop, beside the archive): `latest.jpg`,
+the last still's zone with the boxes; the stills where something was found, kept like that by day, at
+most one each `realtime-keep` minutes (15) while the number found stays the same, since a parked car is
+found all day and the archive has every still; and `realtime.jsonl`, a line per still. The journal has
+the stills searched, the damaged, the arrivals and departures, and a summary each hour:
 
 ```
 20261111093258 change 5/202 | car 0.89 moved, car 0.85 moved | 4.0s of 5.3s  << arrived
